@@ -9,8 +9,12 @@
 - 历史聊天其实还在，但左侧列表突然只剩很少几条
 - 切换过 `provider` 之后，旧会话列表消失
 - 重新打开 Codex 后，有时能看到，有时又看不到
+- 最近几条会话明明有内容，但左侧列表里就是不出现
 
-这套脚本修的是“线程的 `model_provider` 与当前 provider 不一致，导致列表显示受过滤影响”这一类问题。
+这套脚本主要修两类会导致侧边栏过滤掉历史的问题：
+
+- 线程的 `model_provider` 与当前 provider 不一致
+- 线程明明有首条用户消息，但 `has_user_event` 被标成 `0`
 
 它不是数据恢复工具。如果数据库里的历史真的已经被删除，这个脚本无法凭空找回。
 
@@ -45,9 +49,10 @@
 
 它会：
 
-- 自动读取当前机器的 Codex 配置
+- 自动读取当前机器的 Codex 配置；如果配置里没有 `model_provider`，就从最新会话推断当前 provider
 - 备份 `state_5.sqlite`
 - 把有用户消息的线程统一修正到当前 `model_provider`
+- 把有首条用户消息但 `has_user_event=0` 的线程补回 `has_user_event=1`
 
 这个版本不会主动重启 Codex 后端，所以更稳，不容易把界面瞬间切到报错页。
 
@@ -61,11 +66,19 @@
 
 ## PowerShell 手动运行示例
 
-### 用当前配置里的 provider 修复
+### 自动推断当前 provider 并修复
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\repair-codex-history.ps1
 ```
+
+脚本会按下面顺序确定目标 provider：
+
+1. 命令行传入的 `-Provider`
+2. `config.toml` 里的 `model_provider`
+3. `state_5.sqlite` 里最新线程的 `model_provider`
+
+如果自动推断不符合你的实际情况，可以手动传 `-Provider`。
 
 ### 指定 provider 修复
 
@@ -90,20 +103,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\repair-codex-history.ps1 -
 脚本会执行下面这些动作：
 
 1. 定位 `config.toml` 和 `state_5.sqlite`
-2. 读取当前 `model_provider`
+2. 确定目标 `model_provider`
 3. 先备份数据库，备份文件名形如：
 
 ```text
 state_5.sqlite.provider-fix-20260421-153000.bak
 ```
 
-4. 更新 `threads` 表，把满足下面条件的线程改成当前 provider：
+4. 修正 `threads` 表里“有首条用户消息但 `has_user_event=0`”的线程
+5. 更新 `threads` 表，把满足下面条件的线程改成目标 provider：
 
 - `has_user_event = 1`
+- 或 `first_user_message` 非空
 - `model_provider` 为空
-- 或 `model_provider` 与当前 provider 不同
+- 或 `model_provider` 与目标 provider 不同
 
-5. 输出修复前后的 provider 分布
+6. 输出修复前后的 provider 与 `has_user_event` 分布
 
 ## 关于 `disable_response_storage`
 

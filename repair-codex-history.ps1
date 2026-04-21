@@ -64,6 +64,50 @@ function Get-ConfigBool {
     return $null
 }
 
+function Get-ProviderFromLatestThread {
+    param(
+        [string]$DbPath,
+        [string]$Python
+    )
+
+    $pythonCode = @'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+
+conn = sqlite3.connect(db_path, timeout=10)
+cur = conn.cursor()
+row = cur.execute(
+    """
+    select model_provider
+    from threads
+    where model_provider is not null
+      and trim(model_provider) <> ''
+    order by coalesce(updated_at_ms, updated_at * 1000) desc
+    limit 1
+    """
+).fetchone()
+conn.close()
+
+if row is None:
+    sys.exit(2)
+
+print(row[0])
+'@
+
+    $provider = $pythonCode | & $Python - $DbPath
+    if ($LASTEXITCODE -eq 0) {
+        return $provider.Trim()
+    }
+
+    if ($LASTEXITCODE -eq 2) {
+        return $null
+    }
+
+    throw "Could not infer current model_provider from the latest database thread. Pass -Provider explicitly."
+}
+
 function Resolve-CodexHome {
     param([string]$ExplicitPath)
 
@@ -98,8 +142,17 @@ if (-not $Provider) {
     $Provider = Get-ConfigValue -Path $configPath -Key "model_provider"
 }
 
+$python = Resolve-Python
+
 if (-not $Provider) {
-    throw "Could not resolve model_provider from config.toml. Pass -Provider explicitly."
+    $Provider = Get-ProviderFromLatestThread -DbPath $dbPath -Python $python
+    if ($Provider) {
+        Write-Info "Inferred current model_provider from the latest database thread."
+    }
+}
+
+if (-not $Provider) {
+    throw "Could not resolve current model_provider from config.toml or the state database. Pass -Provider explicitly."
 }
 
 $disableResponseStorage = Get-ConfigBool -Path $configPath -Key "disable_response_storage"
@@ -115,7 +168,6 @@ Write-Info "Backup created: $backupPath"
 Write-Info "Codex home: $resolvedCodexHome"
 Write-Info "Target provider: $Provider"
 
-$python = Resolve-Python
 $pythonCode = @'
 import json
 import sqlite3
@@ -130,11 +182,10 @@ cur = conn.cursor()
 before = list(
     cur.execute(
         """
-        select archived, model_provider, count(*)
+        select archived, model_provider, has_user_event, count(*)
         from threads
-        where has_user_event = 1
-        group by archived, model_provider
-        order by archived, model_provider
+        group by archived, model_provider, has_user_event
+        order by archived, model_provider, has_user_event
         """
     )
 )
@@ -142,8 +193,25 @@ before = list(
 cur.execute(
     """
     update threads
+    set has_user_event = 1
+    where has_user_event = 0
+      and first_user_message is not null
+      and trim(first_user_message) <> ''
+    """
+)
+user_event_rows_updated = cur.rowcount
+
+cur.execute(
+    """
+    update threads
     set model_provider = ?
-    where has_user_event = 1
+    where (
+            has_user_event = 1
+         or (
+                first_user_message is not null
+            and trim(first_user_message) <> ''
+            )
+      )
       and (
             model_provider is null
          or trim(model_provider) = ''
@@ -152,23 +220,23 @@ cur.execute(
     """,
     (provider, provider),
 )
-rows_updated = cur.rowcount
+provider_rows_updated = cur.rowcount
 conn.commit()
 
 after = list(
     cur.execute(
         """
-        select archived, model_provider, count(*)
+        select archived, model_provider, has_user_event, count(*)
         from threads
-        where has_user_event = 1
-        group by archived, model_provider
-        order by archived, model_provider
+        group by archived, model_provider, has_user_event
+        order by archived, model_provider, has_user_event
         """
     )
 )
 
 result = {
-    "rows_updated": rows_updated,
+    "provider_rows_updated": provider_rows_updated,
+    "user_event_rows_updated": user_event_rows_updated,
     "before": before,
     "after": after,
 }
@@ -184,15 +252,16 @@ if ($LASTEXITCODE -ne 0) {
 
 $result = $resultJson | ConvertFrom-Json
 
-Write-Info ("Rows updated: " + $result.rows_updated)
+Write-Info ("Provider rows updated: " + $result.provider_rows_updated)
+Write-Info ("User-event flags updated: " + $result.user_event_rows_updated)
 Write-Info "Before:"
 foreach ($row in $result.before) {
-    Write-Host ("  archived=" + $row[0] + " provider=" + $row[1] + " count=" + $row[2])
+    Write-Host ("  archived=" + $row[0] + " provider=" + $row[1] + " has_user_event=" + $row[2] + " count=" + $row[3])
 }
 
 Write-Info "After:"
 foreach ($row in $result.after) {
-    Write-Host ("  archived=" + $row[0] + " provider=" + $row[1] + " count=" + $row[2])
+    Write-Host ("  archived=" + $row[0] + " provider=" + $row[1] + " has_user_event=" + $row[2] + " count=" + $row[3])
 }
 
 if ($RestartBackend) {
